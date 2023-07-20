@@ -8,8 +8,11 @@ from typing import (
     Deque,
     Dict,
     FrozenSet,
+    Hashable,
+    Iterable,
     List,
     Mapping,
+    Optional,
     Sequence,
     Set,
     Tuple,
@@ -44,6 +47,9 @@ sequence_annotation_to_type = {
 sequence_types = tuple(sequence_annotation_to_type.keys())
 
 if PYDANTIC_V2:
+    import sys
+    from weakref import WeakKeyDictionary
+
     from pydantic import PydanticSchemaGenerationError as PydanticSchemaGenerationError
     from pydantic import TypeAdapter
     from pydantic import ValidationError as ValidationError
@@ -75,6 +81,34 @@ if PYDANTIC_V2:
     class ErrorWrapper(Exception):
         pass
 
+    class FieldInfoKey:  # FieldInfo as properly hashable
+        def __init__(self, field_info: FieldInfo):
+            def hashable(obj: Any) -> Any:
+                if isinstance(obj, Hashable):
+                    return obj
+                elif isinstance(obj, Mapping):
+                    kv_pairs = ((k, hashable(v)) for k, v in obj.items())
+                    return tuple(sorted(kv_pairs, key=lambda t: t[0]))
+                elif isinstance(obj, Iterable):
+                    return tuple(hashable(item) for item in obj)
+                raise NotImplementedError(f"Not implemented for: {type(obj)}")
+
+            self.field_info = field_info
+            self.field_info_hashable = hashable(field_info._attributes_set)
+
+        def __hash__(self) -> int:
+            return hash(self.field_info_hashable)
+
+        def __eq__(self, other: Any) -> bool:
+            if not isinstance(other, FieldInfoKey):
+                return False
+            return self.field_info._attributes_set == other.field_info._attributes_set
+
+    if sys.version_info >= (3, 9):  # Typing for weak dictionaries available at 3.9
+        TYPE_ADAPTER_WEAK_CACHE = WeakKeyDictionary[FieldInfoKey, TypeAdapter[Any]]()
+    else:
+        TYPE_ADAPTER_WEAK_CACHE = WeakKeyDictionary()
+
     @dataclass
     class ModelField:
         field_info: FieldInfo
@@ -98,10 +132,25 @@ if PYDANTIC_V2:
         def type_(self) -> Any:
             return self.field_info.annotation
 
+        @property
+        def _type_adapter(self) -> TypeAdapter[Any]:
+            # TypeAdapter is heavy so its lazy initialized and memoized
+            if not self._type_adapter_lazy:
+                self._field_info_key = FieldInfoKey(self.field_info)
+
+                if memoized := TYPE_ADAPTER_WEAK_CACHE.get(self._field_info_key):
+                    self._type_adapter_lazy = memoized
+                else:
+                    type_adapter = TypeAdapter(
+                        Annotated[self.field_info.annotation, self.field_info]
+                    )
+                    TYPE_ADAPTER_WEAK_CACHE[self._field_info_key] = type_adapter
+                    self._type_adapter_lazy = type_adapter
+
+            return self._type_adapter_lazy
+
         def __post_init__(self) -> None:
-            self._type_adapter: TypeAdapter[Any] = TypeAdapter(
-                Annotated[self.field_info.annotation, self.field_info]
-            )
+            self._type_adapter_lazy: Optional[TypeAdapter[Any]] = None
 
         def get_default(self) -> Any:
             if self.field_info.is_required():
